@@ -1,0 +1,108 @@
+# All tunable numbers for the simulation live here. Nothing in src/ should
+# hardcode a number that belongs in this file.
+
+run:
+  seed: 42
+  sim_days: 7
+
+network:
+  # Covers Peenya, Bommasandra, Hosur and Whitefield. Hosur sits across the
+  # Karnataka/Tamil Nadu border, so this is a bounding box, not a place name.
+  bbox:
+    north: 13.10
+    south: 12.68
+    east: 77.90
+    west: 77.45
+  cache_path: "data/cache/road_network.graphml"
+  network_type: "drive"
+  # Multiplies free-flow travel time by hour of day (0-23). Models rush-hour
+  # slowdowns without needing live traffic data.
+  travel_time_hourly_multipliers:
+    0: 0.8
+    1: 0.75
+    2: 0.75
+    3: 0.75
+    4: 0.8
+    5: 0.9
+    6: 1.1
+    7: 1.35
+    8: 1.5
+    9: 1.4
+    10: 1.15
+    11: 1.05
+    12: 1.05
+    13: 1.05
+    14: 1.1
+    15: 1.15
+    16: 1.25
+    17: 1.45
+    18: 1.55
+    19: 1.4
+    20: 1.15
+    21: 0.95
+    22: 0.85
+    23: 0.8
+
+fleet:
+  num_trucks: 40
+  capacity_weight_kg: { min: 3000, max: 16000 }
+  capacity_volume_m3: { min: 15, max: 45 }
+  fixed_cost_per_day: { min: 1200, max: 2200 } # driver wage + EMI/lease, amortized (rupees)
+  variable_cost_per_km: { min: 8, max: 14 } # wear + tolls, excludes fuel (rupees/km)
+  fuel_efficiency_kmpl: { min: 3.5, max: 6.0 } # km per litre
+  variable_cost_per_hour_waiting: { min: 40, max: 90 } # rupees/hour
+  reservation_rate_per_km: { min: 11, max: 16 } # minimum acceptable, laden leg (rupees/km)
+  return_leg_discount: { min: 0.10, max: 0.25 } # fraction below reservation accepted on a backhaul
+  max_detour_km: { min: 10, max: 30 }
+  max_wait_hours: { min: 4, max: 24 } # after which a trucker gives up and deadheads
+  home_deadline_probability: 0.3 # fraction of trucks with a home_by deadline this week
+
+demand:
+  # Directional imbalance: industrial zones ship out more than they receive,
+  # which is why trucks arriving there end up empty. Must not be symmetric.
+  zones:
+    - name: "Peenya"
+      lat: 13.0284
+      lon: 77.5199
+      outbound_loads_per_day: { min: 8, max: 14 }
+      inbound_loads_per_day: { min: 2, max: 4 }
+    - name: "Bommasandra"
+      lat: 12.8151
+      lon: 77.6910
+      outbound_loads_per_day: { min: 6, max: 10 }
+      inbound_loads_per_day: { min: 2, max: 4 }
+    - name: "Hosur"
+      lat: 12.7409
+      lon: 77.8253
+      outbound_loads_per_day: { min: 4, max: 7 }
+      inbound_loads_per_day: { min: 4, max: 7 }
+    - name: "Whitefield"
+      lat: 12.9698
+      lon: 77.7500
+      outbound_loads_per_day: { min: 2, max: 4 }
+      inbound_loads_per_day: { min: 8, max: 12 }
+  weight_kg: { min: 1000, max: 12000 }
+  volume_m3: { min: 5, max: 35 }
+  posted_rate_per_km: { min: 11, max: 15 } # advertised rate (rupees/km)
+  reservation_rate_per_km_markup: { min: 0.05, max: 0.20 } # shipper's private ceiling above posted rate
+  penalty_per_hour_late: { min: 100, max: 500 }
+  loading_time_min: { min: 20, max: 60 }
+  unloading_time_min: { min: 20, max: 60 }
+  pickup_window_hours: 3
+  delivery_slack_hours: { min: 2, max: 8 }
+
+matching:
+  broker_commission_rate: 0.10
+  # The matcher's own screening threshold, separate from any one truck's
+  # private max_detour_km (which the optimiser checks and can veto on).
+  # Calibrated from data, not guessed: diagnose_veto_rate.py measured real
+  # road distance running ~1.3-1.9x the straight-line distance this screen
+  # uses, so a naive 25km cap implied ~34-47km of real driving -- looser than
+  # the fleet's own max_detour_km range (10-30km) and the main reason
+  # DETOUR_LIMIT accounted for 77% of all vetoes. 15km keeps the screen a
+  # legitimate public/network-wide calibration (it still can't see any one
+  # truck's private threshold) while not routinely proposing candidates real
+  # roads were never going to let through.
+  max_candidate_detour_km: 15
+  retry_interval_hours: 1.0 # how often a waiting/idle truck re-checks the load board
+  home_deadline_buffer_hours: 2.0 # safety margin before a home_by deadline forces a deadhead
