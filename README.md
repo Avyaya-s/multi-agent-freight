@@ -51,23 +51,27 @@ src/freight_sim/
   geo.py                  haversine (marketplace's coarse candidate screen)
   network.py              OSMnx road network wrapper, with route caching
   demand.py                fleet + load generation, with directional imbalance
-  matching.py             propose_candidates (coarse) / verify_match (optimiser)
+  matching.py             propose_candidates: the marketplace's coarse screen, unchanged since Stage 0
+  feasibility.py          Stage 1: check_feasibility (PHYSICAL, OR-Tools) / check_preference (PREFERENCE, private)
   simulator.py            the discrete-event loop tying it together
   metrics.py              fleet-wide metrics computed from the event log, never live state
   zone_metrics.py         per-zone/per-truck breakdowns (imbalance shows up in the
                           distribution, not the fleet-wide mean -- see README)
 scripts/
-  fetch_network.py            one-off: download + cache the road network
-  run_scenarios.py            baseline vs rule-based vs broker-commission
-  check_demand_imbalance.py   sanity check: does demand match the configured imbalance?
-  run_seed_sweep.py           variance of the headline result across 20 seeds
-  run_imbalance_sweep.py      fleet-wide-mean sensitivity to the imbalance ratio (flat -- see README)
-  run_zone_imbalance_sweep.py per-zone sensitivity to the imbalance ratio (not flat)
-  diagnose_veto_rate.py       why DETOUR_LIMIT dominated vetoes, and whether the fix worked
-  run_stage0_diagnostics.py   all of the above in one process (one route-cache warm-up)
-  imbalance_sweep_utils.py    shared apply_skew() helper
+  fetch_network.py               one-off: download + cache the road network
+  run_scenarios.py               baseline vs rule-based vs broker-commission
+  check_demand_imbalance.py      sanity check: does demand match the configured imbalance?
+  run_seed_sweep.py              variance of the headline result across 20 seeds
+  run_imbalance_sweep.py         fleet-wide-mean sensitivity to the imbalance ratio (flat -- see README)
+  run_zone_imbalance_sweep.py    per-zone sensitivity to the imbalance ratio (not flat)
+  diagnose_veto_rate.py          why DETOUR_LIMIT dominated vetoes, and whether the fix worked
+  run_coarse_filter_sweep.py     sensitivity of the headline result to the coarse-filter threshold
+  run_stage0_diagnostics.py      Stage 0 checks in one process (one route-cache warm-up)
+  run_stage1_full_diagnostics.py Stage 1 checks: main comparison, ablation, seed sweep, rate sweep
+  imbalance_sweep_utils.py       shared apply_skew() helper
 tests/                    pytest, using a fake straight-line network for speed;
-                          test_privacy.py guards the public/platform/private split
+                          test_privacy.py guards the public/platform/private split;
+                          test_feasibility.py covers both layers + a determinism test
 ```
 
 ## Data model
@@ -84,17 +88,24 @@ the tier(s) that agent is allowed to see):
 - `Load.public` / `Load.private` -- a load board posting is public by design;
   only the shipper's true reservation price and late penalty are private
 
+The same tiering shows up again one level down, in how a match gets decided
+(Stage 1, `feasibility.py`): `check_feasibility` (the PHYSICAL layer) only
+ever accepts a `TruckPlatform`, never a `Truck`, so it has no way to reach
+private data even by mistake; `check_preference` (the PREFERENCE layer) is
+the one place `TruckPrivate` is legitimately read, standing in for the
+trucker agent Stage 2 will put at that exact boundary.
+
 The event log is a separate, *omniscient* concern: it may carry private
 fields (e.g. `TRUCK_SPAWNED` carries a truck's cost structure), because it is
 the simulator's own record used for metrics and replay, not a channel
 between agents.
 
 `tests/test_privacy.py` guards this split behaviorally, not just by naming
-convention: it hands `propose_candidates` (the marketplace's coarse screen)
-and `verify_match` (the optimiser) a tripwire object in place of the tier
-they must not read, which raises immediately if any field on it is ever
-accessed. Worth having settled before Stage 2 introduces real agents that
-could otherwise quietly depend on a leak.
+convention: it hands `propose_candidates`, `check_feasibility` and
+`check_preference` a tripwire object in place of the tier they must not
+read, which raises immediately if any field on it is ever accessed. Worth
+having settled before Stage 2 introduces real agents that could otherwise
+quietly depend on a leak.
 
 `Deal` holds final agreed terms only. Negotiation history (Stage 2+) will
 live in the event log under a `negotiation_id`, not on the `Deal` itself --
@@ -111,7 +122,7 @@ share a `sim_time`) and `schema_version` lets later stages replay Stage 0 logs.
 | `TRUCK_SPAWNED` | carries the truck's private cost params, so the log is self-sufficient for metrics |
 | `LOAD_POSTED` / `LOAD_EXPIRED` | |
 | `MATCH_PROPOSED` | the marketplace's coarse screen (public/platform info only); carries `screening_distance_km` (straight-line) for comparison against the optimiser's real distance |
-| `MATCH_VERIFIED` / `MATCH_VETOED` | the optimiser's full-information check; veto reasons: `TIME_WINDOW`, `CAPACITY`, `DETOUR_LIMIT`, `HOME_DEADLINE`; both carry `detour_km` (real road distance) and `max_detour_km` (the truck's own threshold) so the coarse screen can be calibrated against reality -- see `diagnose_veto_rate.py` |
+| `MATCH_VERIFIED` / `MATCH_VETOED` | Stage 1's two-layer feasibility check (`feasibility.py`); veto reasons: `TIME_WINDOW`, `CAPACITY` (PHYSICAL, OR-Tools, public/platform data only), `DETOUR_LIMIT`, `HOME_DEADLINE`, `RATE_TOO_LOW` (PREFERENCE, private data, Stage 1's stand-in for the trucker agent). `MATCH_VETOED` carries `layer` so the two are always reportable separately, plus `detour_km`/`max_detour_km` so the coarse screen can be calibrated against reality -- see `diagnose_veto_rate.py` |
 | `DEAL_CREATED` / `DEAL_COMPLETED` / `DEAL_FAILED` | `DEAL_FAILED` is reserved -- Stage 0 has no breakdowns/no-shows yet |
 | `TRUCK_DEPARTED` / `TRUCK_ARRIVED` | `purpose`: `delivery`, `reposition_to_pickup`, `deadhead_home` (`speculative_reposition` reserved) |
 | `TRUCK_WAIT_STARTED` / `TRUCK_WAIT_ENDED` | away from home, holding out for a load -- counts toward the waiting-time metric |
@@ -314,14 +325,32 @@ trusted on the strength of a single before/after comparison
 timing per value so an earlier value can't unfairly warm the cache for a
 later one):
 
-| coarse filter (km) | mean empty-km reduction | cold-cache time (s) | MATCH_PROPOSED count | vetoes |
-|---|---|---|---|---|
-| [FILTER_10] | [REDUCTION_10] | [TIME_10] | [PROPOSED_10] | [VETOES_10] |
-| [FILTER_15] | [REDUCTION_15] | [TIME_15] | [PROPOSED_15] | [VETOES_15] |
-| [FILTER_20] | [REDUCTION_20] | [TIME_20] | [PROPOSED_20] | [VETOES_20] |
-| [FILTER_25] | [REDUCTION_25] | [TIME_25] | [PROPOSED_25] | [VETOES_25] |
+| coarse filter (km) | mean empty-km reduction | stdev | cold-cache wall time (s) | MATCH_PROPOSED count | vetoes |
+|---|---|---|---|---|---|
+| 10 | 38.9% | 12.3pp | 276.1 | 232 | 78 |
+| 15 (current default) | 39.0% | 12.5pp | 211.8 | 234 | 80 |
+| 20 | 37.5% | 13.2pp | 221.0 | 383 | 225 |
+| 25 (pre-fix default) | 37.0% | 12.7pp | 221.2 | 472 | 314 |
 
-[FILTER_SWEEP_INTERPRETATION]
+**The empty-km reduction is flat across the whole range** (37.0-39.0%, well
+within the ~12-13pp per-point seed noise) -- the headline result does not
+depend on this hand-tuned knob. That's the reassuring answer a reviewer would
+want.
+
+**The wall-clock timing column doesn't cleanly show what compute-cost story
+you'd expect, and it's worth saying why rather than hiding it**: 10km was the
+*slowest* cold-cache run, not the fastest. That's because "cold-cache wall
+time" here is dominated by a fixed cost the filter doesn't affect at all --
+demand generation's own travel-time queries for delivery-window estimation --
+which swamps the comparatively small matching-side cost difference between
+filter settings. **`MATCH_PROPOSED` count is the clean, deterministic proxy
+for matching compute cost instead**, and it is unambiguous: 232 at 10km vs
+472 at 25km, almost exactly doubling, with vetoes climbing from 78 to 314 (4x)
+over the same range. So: the filter recalibration was correctly motivated by
+*proposal/veto volume*, not by wall-clock time, which is too noisy at this
+scale to be the right instrument -- a lesson for how to measure Stage 1's
+OR-Tools compute cost too, where wall time per solver call will matter far
+more directly than it does for today's arithmetic check.
 
 ## Before Stage 1: what should and shouldn't change
 
@@ -333,6 +362,183 @@ doesn't move at all once OR-Tools replaces `verify_match`, that is a sign the
 new feasibility layer isn't binding on anything -- a bug or a no-op
 integration -- not a result to celebrate.** Check this explicitly before
 reporting a Stage 1 headline number.
+
+**Resolved in "Stage 1: real feasibility checking" below.** The prediction
+as stated didn't hold -- OR-Tools alone (holding the constraint set fixed)
+barely moves the number -- but the ablation built to check it surfaced a
+better finding than the one predicted: physical feasibility is nearly free
+in this network, and economics is the actual binding constraint.
+
+## Stage 1: real feasibility checking
+
+### Architecture: physical vs preference, split at the privacy boundary
+
+Stage 0's `verify_match` vetoed on `DETOUR_LIMIT` and `HOME_DEADLINE` using
+`TruckPrivate` fields, which meant "the optimiser" was quietly reading
+private data -- fine for a placeholder, not fine for something meant to
+represent what the *platform* can decide. Stage 1 splits feasibility into
+two layers so the boundary is real, not just a naming convention:
+
+- **PHYSICAL** (`feasibility.check_feasibility`) -- road network, capacity
+  (weight and volume), pickup/delivery time windows, service (loading/
+  unloading) times. Public/platform data only; this is what OR-Tools solves.
+  Its function signature only ever accepts a `TruckPlatform`, not a `Truck`
+  -- a stronger guarantee than a tripwire test, since there is no private
+  field for it to even structurally reach.
+- **PREFERENCE** (`feasibility.check_preference`) -- the truck owner's own
+  standing thresholds: `max_detour_km`, `home_by`, and (new in Stage 1)
+  `reservation_rate_per_km`. Uses `TruckPrivate`. In Stage 1 this is a
+  deterministic filter standing in for the trucker agent; Stage 2 puts an
+  LLM agent at this exact boundary instead, so the PHYSICAL layer never has
+  to change.
+
+Every veto now carries `layer` (`physical` or `preference`) alongside
+`reason`, so "physically impossible" and "owner wouldn't accept" are always
+reportable as separate findings (`metrics.veto_rate_by_layer`). Deferred:
+driver hours-of-service -- there is still no shift-length or rest-rule data
+model to check it against, so it stays flagged rather than faked.
+
+`RATE_TOO_LOW` is a new `VetoReason`: the preference layer now actually
+checks a load's posted rate against the truck's reservation rate (discounted
+by `return_leg_discount` on backhauls) -- something Stage 0 never did at
+all, since it had no rate-based rejection of any kind.
+
+### Two bugs found building this, worth recording
+
+**A native crash in the OR-Tools model.** An "open route" (starts at the
+truck's location, ends at the delivery -- not a round trip) needs
+`RoutingIndexManager(n, 1, [start], [end])`, but `manager.NodeToIndex()`
+returns `-1` for a node used as a vehicle's end node (documented, but easy to
+miss). Calling `CumulVar(-1).SetRange(...)` doesn't raise -- it corrupts
+memory and segfaults the interpreter. Found by bisecting a minimal repro
+line by line until the exact call crashed, then fixed by addressing the end
+node via `routing.End(vehicle)` instead of `NodeToIndex`.
+
+**`reservation_rate_per_km` was never calibrated against anything, because
+nothing depended on it.** It was pure decoration in Stage 0 -- defined,
+sampled, logged, never read by any decision. The moment `RATE_TOO_LOW` made
+it load-bearing, its original range (11-16) turned out to overlap almost
+entirely with, and partly exceed, the demand side's posted rate (11-15),
+producing **100% of all vetoes as rate rejections** in initial testing. Same
+class of bug as the tautological `loaded_return_share` metric from Stage 0:
+a value goes uncalibrated for exactly as long as nothing checks it.
+Recalibrated to 9-14 (see the calibration sweep below for why that choice
+isn't just another guess).
+
+**Config audit, because that bug pattern is worth checking for
+systematically, not just patching once it bites.** Grepped every
+`TruckPrivate`/`LoadPrivate` field for whether anything outside
+`demand.py` (which only samples it) and event payloads (which only log it)
+actually reads it in a decision:
+
+| field | status |
+|---|---|
+| `max_detour_km`, `home_by`, `reservation_rate_per_km` (truck), `return_leg_discount` | **active** -- checked in `feasibility.py` |
+| `max_wait_hours` | **active** -- drives the give-up timeout in `simulator.py` |
+| `fixed_cost_per_day` | **dormant** -- sampled, logged, never nets against earnings anywhere |
+| `variable_cost_per_hour_waiting` | **dormant** -- sampled, logged, never compared against anything |
+| `penalty_per_hour_late` (load) | **dormant** -- no late-delivery outcome exists yet to charge it against |
+| `reservation_rate_per_km` (load, the shipper's private ceiling) | **dormant**, but low risk -- it's derived as `posted_rate * (1 + markup)`, so it's always consistent with the posted rate by construction, unlike the truck-side field which was an independent, uncoupled range |
+
+None of the three genuinely dormant, independently-ranged fields
+(`fixed_cost_per_day`, `variable_cost_per_hour_waiting`,
+`penalty_per_hour_late`) has an existing paired value to check them against
+yet the way `reservation_rate_per_km` had `posted_rate_per_km` -- so there's
+no analogous miscalibration to catch today. The action item is to design
+their calibration *at the moment they're wired into a real decision*, not
+before, and to check it against a paired value immediately when that happens
+rather than assuming a plausible-looking range is a calibrated one.
+
+### The retry storm: a modelling bug, not just noisy metrics
+
+Under Stage 0/1's static-terms model, a truck's private thresholds and a
+load's posted terms never change on their own, so a rejected (truck, load)
+pair will be rejected identically forever. Idle episodes (a truck at home)
+never time out, so a truck that's structurally too expensive for every
+nearby load retried it every hour for the rest of the run: one truck alone
+generated 95 identical `RATE_TOO_LOW` events against the same load before
+this was fixed. A real trucker doesn't re-offer hourly at a price that was
+already refused -- they lower their ask, wait, or go home. Since Stage 0/1
+has no price negotiation yet, the fix is architectural: `Simulator` now
+remembers every `(truck_id, load_id)` pair it has ever vetoed and never
+re-proposes it (`tests/test_simulator.py::test_a_truck_is_never_vetoed_twice_by_the_same_load`
+locks this in). This matters beyond log noise: in Stage 2 the same unbounded
+loop becomes repeated LLM calls, not just repeated arithmetic.
+
+### The ablation: is OR-Tools actually stricter than arithmetic?
+
+Stage 1 changed two things at once -- arithmetic became an OR-Tools solve,
+*and* a brand-new rate check was added that Stage 0 never had -- so the raw
+before/after comparison was confounded (Stage 1's baseline also gained the
+rate check, since at-home dispatch runs the same pipeline regardless of
+mechanism). `scripts/run_stage1_full_diagnostics.py` isolates the two:
+
+| | empty-km reduction (seed 42) |
+|---|---|
+| Stage 0 (arithmetic, no rate check, recalibrated coarse filter) | 27.6% |
+| Stage 1, rate check OFF (OR-Tools, but same constraint set as Stage 0) | 24.6% |
+| Stage 1, rate check ON (the real Stage 1 default) | 30.9% |
+
+**The prediction as originally written ("OR-Tools should be stricter") did
+not hold, and the reason is the more interesting finding.** Rate-check-OFF
+(24.6%) sits close to Stage 0's own number (27.6%) -- switching arithmetic
+for a real solver, holding the checked constraints constant, changes almost
+nothing. The entire gap between Stage 0 and Stage 1's headline comes from
+the *new rate check*, not from OR-Tools being a stricter physical engine.
+Consistent with the veto-layer split: physical vetoes are ~1-2% of the
+total. **Within a single metro region, physical feasibility is nearly free;
+economics is the binding constraint.** That has a real implication for the
+project rather than being a footnote: the interesting constraints live on
+the preference side, which is exactly where Stage 2's LLM agents go. The
+finding is not "the prediction was wrong" so much as "the prediction was
+aimed at the layer that turns out not to matter much here."
+
+### The 20-seed sweep: a surprising stability
+
+`scripts/run_stage1_full_diagnostics.py` Part 3, rate check ON (the Stage 1
+default), 20 seeds:
+
+- mean **40.1%**, stdev **5.6pp**, range **30.9% - 53.3%**
+
+This is statistically indistinguishable from Stage 0's own 20-seed mean
+(40.1% ± 6.5pp, range 27.6-52.3%) computed before any of Stage 1 existed.
+**The single-seed ablation comparison above (24.6% vs 30.9%, a 6.3pp gap)
+does not survive at the population level** -- averaged over 20 seeds, adding
+OR-Tools and the rate check together left the mean essentially unchanged,
+even though it visibly shifts individual-seed values and the veto-reason mix
+substantially. This is the same lesson as the very first seed-variance
+check, now applied one level up: a single-seed comparison of two
+*methodologies* can be just as misleading as a single-seed measurement of
+one methodology's headline number. Report sweeps when comparing methods, not
+just when reporting one method's result.
+
+### The reservation-rate calibration sweep: robust headline, sensitive attribution
+
+Same move as the coarse-filter sweep, for the same reason: 9-14 vs the
+demand side's 11-15 is still a hand-picked overlap that directly sets the
+rate-veto rate, and therefore plausibly the headline number.
+`scripts/run_stage1_full_diagnostics.py` Part 4, 3 seeds per point:
+
+| reservation_rate_per_km | mean empty-km reduction | mean rate-veto share |
+|---|---|---|
+| 6-10 | 37.5% | 0.0% |
+| 8-12 | 40.6% | 15.9% |
+| 9-14 (current default) | 39.8% | 71.1% |
+| 11-15 (matches posted range exactly) | 42.6% | 90.5% |
+| 12-17 (the original, broken calibration) | 47.9% | 96.9% |
+
+**The empty-km reduction stays in a 37.5-47.9% band across the whole
+range** -- a factor-of-two change in where the reservation-rate distribution
+sits barely moves the headline number. That's the reassuring result: the
+~40% figure is not a fragile artifact of one hand-tuned config choice.
+**But which veto reason gets to claim "dominant" absolutely is not robust**
+-- the rate-veto share alone swings from 0% to 97% across this same range.
+The finding "preference vetoes are dominated by rate" from the ablation
+section is therefore a real feature of the *current* config, not a
+law of the simulation; a different, equally defensible calibration choice
+would have made `home_deadline` or `detour_limit` look dominant instead.
+Report the headline number with confidence; report which reason "wins" only
+alongside the calibration it was measured under.
 
 ### On the broker-commission result
 
