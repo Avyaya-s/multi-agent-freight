@@ -51,7 +51,14 @@ fleet:
   variable_cost_per_km: { min: 8, max: 14 } # wear + tolls, excludes fuel (rupees/km)
   fuel_efficiency_kmpl: { min: 3.5, max: 6.0 } # km per litre
   variable_cost_per_hour_waiting: { min: 40, max: 90 } # rupees/hour
-  reservation_rate_per_km: { min: 11, max: 16 } # minimum acceptable, laden leg (rupees/km)
+  # Minimum acceptable, laden leg (rupees/km). Calibrated below
+  # demand.posted_rate_per_km (11-15) with only partial overlap: Stage 0 never
+  # actually checked this field against anything, so it went uncalibrated
+  # until Stage 1's RATE_TOO_LOW check made it load-bearing for the first
+  # time -- an un-calibrated 11-16 range (overlapping almost entirely with,
+  # and partly *above*, the demand side's posted rate) produced 100% of all
+  # vetoes as rate rejections in testing, which is not a realistic economy.
+  reservation_rate_per_km: { min: 9, max: 14 }
   return_leg_discount: { min: 0.10, max: 0.25 } # fraction below reservation accepted on a backhaul
   max_detour_km: { min: 10, max: 30 }
   max_wait_hours: { min: 4, max: 24 } # after which a trucker gives up and deadheads
@@ -106,3 +113,10 @@ matching:
   max_candidate_detour_km: 15
   retry_interval_hours: 1.0 # how often a waiting/idle truck re-checks the load board
   home_deadline_buffer_hours: 2.0 # safety margin before a home_by deadline forces a deadhead
+
+optimizer:
+  # PHYSICAL-layer feasibility (feasibility.check_feasibility) is solved with
+  # OR-Tools. Fixed time limit + first-solution strategy, no local-search
+  # metaheuristic: identical input must give identical output.
+  time_limit_ms: 50
+  first_solution_strategy: "PATH_CHEAPEST_ARC"

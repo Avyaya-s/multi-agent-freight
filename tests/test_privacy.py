@@ -3,20 +3,30 @@ leans on. Two kinds of check:
 
   - structural: no field name is duplicated across tiers (a cheap sanity
     check that would catch a copy-paste mistake)
-  - behavioral: the marketplace's coarse screen (propose_candidates) and the
-    optimiser's shipper-side view (verify_match) are handed a tripwire object
-    in place of the tier they must not read, and the test fails immediately
-    if any attribute on it is ever accessed. This is worth having before
-    Stage 2 introduces real agents, since it is much cheaper to catch a leak
-    here than after agent code exists that depends on one.
+  - behavioral: the marketplace's coarse screen (propose_candidates) and both
+    feasibility layers (check_feasibility, check_preference) are handed a
+    tripwire object in place of the tier they must not read, and the test
+    fails immediately if any attribute on it is ever accessed. This is worth
+    having before Stage 2 introduces real agents, since it is much cheaper to
+    catch a leak here than after agent code exists that depends on one.
+
+    check_feasibility's signature only ever accepts a TruckPlatform, not a
+    Truck, so it has no way to structurally reach truck.private at all --
+    a stronger guarantee than a tripwire can give. What both feasibility
+    layers must still be proven not to touch is the *shipper's* private
+    reservation price: a trucker's preference layer legitimately compares
+    against the load's public posted rate, never the shipper's secret
+    reservation price underneath it.
 """
 
 from __future__ import annotations
 
 import dataclasses
+from datetime import datetime
 
-from freight_sim.config import MatchingConfig
-from freight_sim.matching import propose_candidates, verify_match
+from freight_sim.config import MatchingConfig, SolverConfig
+from freight_sim.feasibility import check_feasibility, check_preference
+from freight_sim.matching import propose_candidates
 from freight_sim.models import LoadPrivate, LoadPublic, TruckPlatform, TruckPrivate, TruckPublic
 from test_models import make_load, make_truck
 
@@ -26,6 +36,7 @@ MATCHING_CFG = MatchingConfig(
     retry_interval_hours=1.0,
     home_deadline_buffer_hours=2.0,
 )
+SOLVER_CFG = SolverConfig(time_limit_ms=50, first_solution_strategy="PATH_CHEAPEST_ARC")
 
 
 class TripWire:
@@ -60,15 +71,24 @@ def test_propose_candidates_never_reads_truck_private(fake_network):
     assert candidates == [load]
 
 
-def test_verify_match_never_reads_load_private(fake_network):
-    """verify_match (the optimiser) legitimately needs the truck's private
-    constraints (that's its whole job), but has no reason to know the
-    shipper's true reservation price -- feasibility is about time/capacity/
-    detour, not money."""
-    from datetime import datetime
-
+def test_check_feasibility_never_reads_load_private(fake_network):
+    """The PHYSICAL layer checks time windows, capacity and routing -- it has
+    no reason to know the shipper's true reservation price."""
     truck = make_truck()
     load = make_load()
     load.private = TripWire()
-    result = verify_match(truck, load, fake_network, datetime(2024, 1, 1, 8))
-    assert result.ok
+    [result] = check_feasibility(truck.platform, [load], [], fake_network, datetime(2024, 1, 1, 8), SOLVER_CFG)
+    assert result.feasible
+
+
+def test_check_preference_never_reads_load_private(fake_network):
+    """The PREFERENCE layer legitimately reads the truck's own private
+    thresholds (that's its whole job), but must compare against the load's
+    *public* posted rate, never the shipper's private reservation price
+    underneath it."""
+    truck = make_truck()
+    load = make_load()
+    [physical] = check_feasibility(truck.platform, [load], [], fake_network, datetime(2024, 1, 1, 8), SOLVER_CFG)
+    load.private = TripWire()
+    result = check_preference(truck.private, load, physical, is_backhaul=False, network=fake_network)
+    assert result.feasible

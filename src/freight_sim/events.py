@@ -68,10 +68,24 @@ class DeadheadReason(str, Enum):
 
 
 class VetoReason(str, Enum):
+    # PHYSICAL layer (feasibility.check_feasibility): public/platform data only.
     TIME_WINDOW = "time_window"
     CAPACITY = "capacity"
+    # PREFERENCE layer (feasibility.check_preference): TruckPrivate data.
+    # Stage 1's deterministic stand-in for the trucker agent; Stage 2 puts an
+    # LLM at this same boundary.
     DETOUR_LIMIT = "detour_limit"
     HOME_DEADLINE = "home_deadline"
+    RATE_TOO_LOW = "rate_too_low"
+
+
+class FeasibilityLayer(str, Enum):
+    """Which layer rejected (or would have decided) a match. Logged on every
+    veto so "physically impossible" and "owner wouldn't accept" are reported
+    as separate findings, never pooled into one veto rate."""
+
+    PHYSICAL = "physical"
+    PREFERENCE = "preference"
 
 
 class DealFailureReason(str, Enum):

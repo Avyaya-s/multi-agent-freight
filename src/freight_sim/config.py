@@ -84,12 +84,22 @@ class MatchingConfig(BaseModel):
     home_deadline_buffer_hours: float
 
 
+class SolverConfig(BaseModel):
+    # Fixed time limit and first-solution strategy (no local-search
+    # metaheuristic is enabled) so identical input always gives an identical
+    # result -- see feasibility.py. The strategy name must be a valid
+    # ortools.constraint_solver.routing_enums_pb2.FirstSolutionStrategy member.
+    time_limit_ms: float
+    first_solution_strategy: str
+
+
 class Config(BaseModel):
     run: RunConfig
     network: NetworkConfig
     fleet: FleetConfig
     demand: DemandConfig
     matching: MatchingConfig
+    optimizer: SolverConfig
 
 
 def config_hash(raw_text: str) -> str:

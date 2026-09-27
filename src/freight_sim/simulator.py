@@ -33,8 +33,9 @@ from freight_sim.events import (
     EventLog,
     EventType,
 )
+from freight_sim.feasibility import FeasibilityResult, check_feasibility, check_preference
 from freight_sim.geo import haversine_km
-from freight_sim.matching import propose_candidates, verify_match
+from freight_sim.matching import propose_candidates
 from freight_sim.models import (
     Deal,
     DealStatus,
@@ -55,12 +56,26 @@ def _loc(location: Location) -> dict[str, float]:
 
 
 class Simulator:
-    def __init__(self, config: Config, network: RoadNetwork, mechanism: MatchMechanism, run_id: str, log_path: str | Path):
+    def __init__(
+        self,
+        config: Config,
+        network: RoadNetwork,
+        mechanism: MatchMechanism,
+        run_id: str,
+        log_path: str | Path,
+        check_rate: bool = True,
+    ):
         self.config = config
         self.network = network
         self.mechanism = mechanism
         self.rng = random.Random(config.run.seed)
         self.log = EventLog(Path(log_path), run_id)
+        # Ablation hook for scripts/run_rate_ablation.py only -- always True
+        # in ordinary use. Isolates "is OR-Tools stricter than arithmetic?"
+        # from "does the (new in Stage 1) rate check change the result?" by
+        # letting a diagnostic run reproduce Stage 0's exact constraint set
+        # (no rate check) on the new physical/preference architecture.
+        self._check_rate = check_rate
 
         self._heap: list[tuple[datetime, int, str, dict[str, Any]]] = []
         self._seq = itertools.count()
@@ -69,6 +84,16 @@ class Simulator:
         self.deals: dict[str, Deal] = {}
         self._token: dict[str, int] = {}
         self._episode_start: dict[str, datetime] = {}
+        # Once a (truck, load) pair is vetoed for any reason, it will be
+        # vetoed identically forever under Stage 0/1's static-terms model --
+        # neither the truck's private thresholds nor the load's posted terms
+        # ever change on their own. Without this, a truck retrying hourly
+        # against a load it can never afford generates one veto event per
+        # retry for the rest of the run (seen in testing: one truck alone
+        # produced 95 identical rate_too_low events against the same load).
+        # In Stage 2 that same unbounded loop becomes repeated LLM calls, not
+        # just log noise, so this is fixed at the architecture level now.
+        self._rejected_pairs: set[tuple[str, str]] = set()
 
         self.end_time = EPOCH + timedelta(days=config.run.sim_days) + timedelta(hours=48)
 
@@ -331,10 +356,22 @@ class Simulator:
         # (loaded_return_share) key off this distinction, not off "any deal."
         is_backhaul = haversine_km(truck.platform.current_location, truck.private.home_location) > HOME_PROXIMITY_KM
 
-        open_loads = [load for load in self.loads.values() if load.public.status == LoadStatus.OPEN]
-        candidates = propose_candidates(truck, open_loads, self.config.matching)
+        open_loads = [
+            load
+            for load in self.loads.values()
+            if load.public.status == LoadStatus.OPEN and (truck.truck_id, load.load_id) not in self._rejected_pairs
+        ]
+        candidates = propose_candidates(truck, open_loads, self.config.matching)[:3]
+        if not candidates:
+            return None
 
-        for candidate in candidates[:3]:
+        # Batch call to the PHYSICAL layer -- see feasibility.py. Stage 1
+        # still evaluates each candidate independently (no committed legs, no
+        # joint bundle sequencing yet), but the interface won't need to change
+        # when a later stage needs to evaluate bundles.
+        physical_results = check_feasibility(truck.platform, candidates, [], self.network, time, self.config.optimizer)
+
+        for candidate, physical in zip(candidates, physical_results):
             negotiation_id = str(uuid.uuid4())
             # The marketplace's own coarse-screen distance (straight-line), logged
             # alongside the optimiser's real road-network detour_km below so the
@@ -353,22 +390,14 @@ class Simulator:
                     "screening_distance_km": screening_distance_km,
                 },
             )
-            result = verify_match(truck, candidate, self.network, time)
-            if not result.ok:
-                self.log.emit(
-                    time,
-                    EventType.MATCH_VETOED,
-                    negotiation_id,
-                    {
-                        "truck_id": truck.truck_id,
-                        "load_id": candidate.load_id,
-                        "reason": result.reason.value,
-                        "is_backhaul": is_backhaul,
-                        "screening_distance_km": screening_distance_km,
-                        "detour_km": result.detour_km,
-                        "max_detour_km": truck.private.max_detour_km,
-                    },
-                )
+
+            if not physical.feasible:
+                self._emit_veto(time, negotiation_id, truck, candidate, physical, is_backhaul, screening_distance_km)
+                continue
+
+            preference = check_preference(truck.private, candidate, physical, is_backhaul, self.network, check_rate=self._check_rate)
+            if not preference.feasible:
+                self._emit_veto(time, negotiation_id, truck, candidate, preference, is_backhaul, screening_distance_km)
                 continue
 
             self.log.emit(
@@ -378,22 +407,53 @@ class Simulator:
                 {
                     "truck_id": truck.truck_id,
                     "load_id": candidate.load_id,
-                    "detour_km": result.detour_km,
-                    "detour_min": result.detour_min,
-                    "pickup_eta": result.pickup_eta.isoformat(),
-                    "delivery_eta": result.delivery_eta.isoformat(),
+                    "detour_km": preference.detour_km,
+                    "detour_min": preference.detour_min,
+                    "pickup_eta": preference.pickup_eta.isoformat(),
+                    "delivery_eta": preference.delivery_eta.isoformat(),
+                    "slack_min": preference.slack_min,
+                    "marginal_cost": preference.marginal_cost,
                     "is_backhaul": is_backhaul,
                     "screening_distance_km": screening_distance_km,
                     "max_detour_km": truck.private.max_detour_km,
+                    "solver_ms": physical.solver_ms + preference.solver_ms,
                 },
             )
-            self._create_and_execute_deal(truck, candidate, negotiation_id, time, result, is_backhaul)
+            self._create_and_execute_deal(truck, candidate, negotiation_id, time, preference, is_backhaul)
             return candidate
 
         return None
 
+    def _emit_veto(
+        self,
+        time: datetime,
+        negotiation_id: str,
+        truck: Truck,
+        candidate: Load,
+        result: FeasibilityResult,
+        is_backhaul: bool,
+        screening_distance_km: float,
+    ) -> None:
+        self._rejected_pairs.add((truck.truck_id, candidate.load_id))
+        self.log.emit(
+            time,
+            EventType.MATCH_VETOED,
+            negotiation_id,
+            {
+                "truck_id": truck.truck_id,
+                "load_id": candidate.load_id,
+                "reason": result.reason.value,
+                "layer": result.layer.value,
+                "is_backhaul": is_backhaul,
+                "screening_distance_km": screening_distance_km,
+                "detour_km": result.detour_km,
+                "max_detour_km": truck.private.max_detour_km,
+                "solver_ms": result.solver_ms,
+            },
+        )
+
     def _create_and_execute_deal(
-        self, truck: Truck, load: Load, negotiation_id: str, depart_time: datetime, result, is_backhaul: bool
+        self, truck: Truck, load: Load, negotiation_id: str, depart_time: datetime, result: FeasibilityResult, is_backhaul: bool
     ) -> None:
         deal_id = str(uuid.uuid4())
         commission_rate = self.config.matching.broker_commission_rate if self.mechanism == MatchMechanism.BROKER_COMMISSION else None
@@ -428,6 +488,7 @@ class Simulator:
                 "deliver_by": deal.deliver_by.isoformat(),
                 "detour_km": result.detour_km,
                 "is_backhaul": is_backhaul,
+                "marginal_cost": result.marginal_cost,
             },
         )
 

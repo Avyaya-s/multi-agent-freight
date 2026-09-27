@@ -76,3 +76,18 @@ def test_seq_is_monotonic_across_a_full_run(small_config, fake_network, tmp_path
     seqs = [e.seq for e in events]
     assert seqs == sorted(seqs)
     assert len(seqs) == len(set(seqs))
+
+
+def test_a_truck_is_never_vetoed_twice_by_the_same_load(small_config, fake_network, tmp_path: Path):
+    """Regression test for the retry storm: under Stage 0/1's static-terms
+    model, a rejected (truck, load) pair will be rejected identically forever
+    (neither side's terms ever change on their own), so a truck retrying
+    hourly against a load it can never afford must not generate a fresh veto
+    every retry -- see Simulator._rejected_pairs."""
+    events = run(small_config, fake_network, MatchMechanism.RULE_BASED, tmp_path, "retry_storm")
+    seen: set[tuple[str, str]] = set()
+    for e in events:
+        if e.event_type == EventType.MATCH_VETOED:
+            pair = (e.payload["truck_id"], e.payload["load_id"])
+            assert pair not in seen, f"{pair} was vetoed more than once"
+            seen.add(pair)

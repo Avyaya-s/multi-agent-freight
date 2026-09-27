@@ -20,6 +20,16 @@ class Metrics:
     num_deadhead_departures: int
     num_match_vetoed: int
     veto_by_reason: Counter = field(default_factory=Counter)
+    veto_by_layer: Counter = field(default_factory=Counter)
+    # A truck that is idle at home and structurally too expensive for every
+    # nearby load will retry every hour for the rest of the run without ever
+    # timing out (idle episodes, unlike waiting ones, never give up), so a
+    # handful of such trucks can generate a large share of raw veto *events*
+    # against the same few (truck, load) pairs. veto_by_reason/veto_by_layer
+    # count events (volume); this counts distinct (truck_id, load_id, reason)
+    # combinations (breadth), so "which reason is common" and "how many
+    # trucks/loads does it actually touch" don't get conflated.
+    veto_unique_pairs_by_reason: Counter = field(default_factory=Counter)
     empty_km: float = 0.0
     laden_km: float = 0.0
     fuel_liters: float = 0.0
@@ -62,19 +72,34 @@ class Metrics:
         }
 
     def veto_rate_by_reason(self) -> dict[str, float]:
-        """Fraction of all vetoes attributable to each reason. Even in Stage 0,
-        vetoes are not rare -- the marketplace's coarse screen only checks
-        capacity and a generous straight-line distance, so most of the real
-        (road-network) detour and the truck's private home-deadline constraint
-        only get checked at verification, producing a veto roughly twice as
-        often as a successful match in the default config. Stage 1 replaces
-        the coarse screen's straight-line distance with something closer to
-        real feasibility, so this rate is expected to change, not appear from
-        nothing."""
+        """Fraction of all vetoes attributable to each reason. Vetoes were
+        never rare in this simulator, even before Stage 1's real feasibility
+        engine -- the marketplace's coarse screen only checks capacity and a
+        calibrated straight-line distance, so most of the detailed checking
+        happens downstream."""
         total = sum(self.veto_by_reason.values())
         if not total:
             return {}
         return {reason: count / total for reason, count in self.veto_by_reason.items()}
+
+    def veto_rate_by_layer(self) -> dict[str, float]:
+        """Fraction of all vetoes attributable to each layer (Stage 1+):
+        PHYSICAL (road network, capacity, time windows -- public/platform
+        data only) vs PREFERENCE (the truck owner's own thresholds -- private
+        data). "Physically impossible" and "owner wouldn't accept" are
+        different findings and must be reported separately, not pooled."""
+        total = sum(self.veto_by_layer.values())
+        if not total:
+            return {}
+        return {layer: count / total for layer, count in self.veto_by_layer.items()}
+
+    def veto_rate_unique_pairs_by_reason(self) -> dict[str, float]:
+        """Same as veto_rate_by_reason, but counting distinct (truck, load)
+        pairs instead of raw retry events -- see veto_unique_pairs_by_reason."""
+        total = sum(self.veto_unique_pairs_by_reason.values())
+        if not total:
+            return {}
+        return {reason: count / total for reason, count in self.veto_unique_pairs_by_reason.items()}
 
 
 def compute_metrics(log_path: str | Path) -> Metrics:
@@ -85,6 +110,9 @@ def compute_metrics(log_path: str | Path) -> Metrics:
     num_deadhead_departures = 0
     num_match_vetoed = 0
     veto_by_reason: Counter = Counter()
+    veto_by_layer: Counter = Counter()
+    veto_unique_pairs_by_reason: Counter = Counter()
+    seen_veto_pairs: set[tuple[str, str, str]] = set()
     empty_km = 0.0
     laden_km = 0.0
     km_by_truck: dict[str, float] = {}
@@ -118,7 +146,15 @@ def compute_metrics(log_path: str | Path) -> Metrics:
 
         elif event.event_type == EventType.MATCH_VETOED:
             num_match_vetoed += 1
-            veto_by_reason[event.payload["reason"]] += 1
+            reason = event.payload["reason"]
+            veto_by_reason[reason] += 1
+            if "layer" in event.payload:
+                veto_by_layer[event.payload["layer"]] += 1
+            if "truck_id" in event.payload and "load_id" in event.payload:
+                pair_key = (event.payload["truck_id"], event.payload["load_id"], reason)
+                if pair_key not in seen_veto_pairs:
+                    seen_veto_pairs.add(pair_key)
+                    veto_unique_pairs_by_reason[reason] += 1
 
         elif event.event_type == EventType.DEAL_COMPLETED:
             num_deals_completed += 1
@@ -143,6 +179,8 @@ def compute_metrics(log_path: str | Path) -> Metrics:
         num_deadhead_departures=num_deadhead_departures,
         num_match_vetoed=num_match_vetoed,
         veto_by_reason=veto_by_reason,
+        veto_by_layer=veto_by_layer,
+        veto_unique_pairs_by_reason=veto_unique_pairs_by_reason,
         empty_km=empty_km,
         laden_km=laden_km,
         fuel_liters=fuel_liters,
