@@ -1,6 +1,48 @@
 # Agent-to-Agent Freight Marketplace (simulation)
 
-Stage 0: simulator skeleton, data model, and baseline metrics. No AI yet.
+Stage 0: simulator skeleton, data model, and baseline metrics. Stage 1: real
+feasibility checking (OR-Tools). No AI agents yet.
+
+## Methodology: three ways a number can mislead without being wrong
+
+These recur throughout the checks below, in three different forms. Reading
+them here once is more useful than hitting each as a surprise three times.
+
+1. **An aggregate can hide the effect you're testing for.** Sweeping the
+   demand generator's imbalance ratio left the *fleet-wide mean* empty-km
+   reduction flat, which looked like the marketplace's benefit had nothing to
+   do with directional imbalance. It didn't: a *zone-level* breakdown showed
+   a 3pp-to-74pp gap between net-exporter and net-importer zones that the
+   fleet-wide mean was averaging away, because the two groups move in
+   opposite, largely canceling directions. **Whenever an aggregate looks
+   suspiciously flat or suspiciously stable, check the distribution by a
+   relevant grouping before concluding the effect isn't there** -- this
+   applies to grouping by zone, and it applies to grouping by seed (below).
+
+2. **A single seed, or a single-seed comparison of two methodologies, can
+   mislead in either direction.** Seed 42 was the *lowest* of 20 seeds, not
+   once but twice, across two different config states -- reporting it alone
+   would have understated the effect, not flattered it, but it was still the
+   wrong number to lead with either way. The same trap reappears one level up:
+   a single-seed comparison between Stage 0 and Stage 1 showed a 6.3pp gap
+   that vanished entirely once averaged over 20 seeds (r=0.77 correlation
+   between the two sweeps' per-seed values, mean difference 0.02pp). **Sweep
+   seeds before reporting one version's number, and sweep seeds on both sides
+   before reporting a delta between two versions.**
+
+3. **A raw event count can misrepresent breadth as volume.** One truck
+   retrying an unaffordable load hourly for the rest of a run generated 95
+   near-identical veto events by itself, making a single structural mismatch
+   look like a fleet-wide pattern in any metric that just counts events.
+   Fixed at the architecture level (a rejected pair is never re-proposed),
+   but the general lesson is broader: **when an event can legitimately recur
+   for the same underlying cause, count distinct causes (here, distinct
+   (truck, load) pairs) alongside raw event counts, not instead of checking
+   whether they agree.**
+
+None of these three is specific to this project's domain -- they're generic
+failure modes of trusting a summary statistic without first asking what
+population or distribution it's actually summarizing.
 
 ## Setup
 
@@ -465,13 +507,22 @@ re-proposes it (`tests/test_simulator.py::test_a_truck_is_never_vetoed_twice_by_
 locks this in). This matters beyond log noise: in Stage 2 the same unbounded
 loop becomes repeated LLM calls, not just repeated arithmetic.
 
-### The ablation: is OR-Tools actually stricter than arithmetic?
+### The headline finding: veto composition is calibration-sensitive, the outcome isn't
 
-Stage 1 changed two things at once -- arithmetic became an OR-Tools solve,
-*and* a brand-new rate check was added that Stage 0 never had -- so the raw
-before/after comparison was confounded (Stage 1's baseline also gained the
-rate check, since at-home dispatch runs the same pipeline regardless of
-mechanism). `scripts/run_stage1_full_diagnostics.py` isolates the two:
+The next three checks fit together into one methodological result worth
+stating up front, not leaving buried in three separate tables: **the system
+finds roughly the same matches regardless of how the constraints are
+calibrated; what changes is which constraint gets the credit for blocking
+the rest.** That distinction -- between "does the mechanism work" and "which
+number explains why" -- is the actual finding here, and most simulation
+write-ups never check it.
+
+**Is OR-Tools actually stricter than arithmetic? No.** Stage 1 changed two
+things at once -- arithmetic became an OR-Tools solve, *and* a brand-new
+rate check was added that Stage 0 never had -- so the raw before/after
+comparison was confounded (Stage 1's baseline also gained the rate check,
+since at-home dispatch runs the same pipeline regardless of mechanism).
+`scripts/run_stage1_full_diagnostics.py` isolates the two:
 
 | | empty-km reduction (seed 42) |
 |---|---|
@@ -479,21 +530,21 @@ mechanism). `scripts/run_stage1_full_diagnostics.py` isolates the two:
 | Stage 1, rate check OFF (OR-Tools, but same constraint set as Stage 0) | 24.6% |
 | Stage 1, rate check ON (the real Stage 1 default) | 30.9% |
 
-**The prediction as originally written ("OR-Tools should be stricter") did
-not hold, and the reason is the more interesting finding.** Rate-check-OFF
-(24.6%) sits close to Stage 0's own number (27.6%) -- switching arithmetic
-for a real solver, holding the checked constraints constant, changes almost
-nothing. The entire gap between Stage 0 and Stage 1's headline comes from
-the *new rate check*, not from OR-Tools being a stricter physical engine.
-Consistent with the veto-layer split: physical vetoes are ~1-2% of the
-total. **Within a single metro region, physical feasibility is nearly free;
-economics is the binding constraint.** That has a real implication for the
-project rather than being a footnote: the interesting constraints live on
-the preference side, which is exactly where Stage 2's LLM agents go. The
-finding is not "the prediction was wrong" so much as "the prediction was
-aimed at the layer that turns out not to matter much here."
+Rate-check-OFF (24.6%) sits close to Stage 0's own number (27.6%) --
+switching arithmetic for a real solver, holding the checked constraints
+constant, changes almost nothing. The entire gap between Stage 0 and Stage
+1's headline comes from the *new rate check*, not from OR-Tools being a
+stricter physical engine -- consistent with the veto-layer split, where
+physical vetoes are ~1-2% of the total. **Within a single metro region,
+physical feasibility is nearly free; economics is the binding constraint.**
+This is load-bearing for the project, not a footnote: it's why Stage 2 (LLM
+agents reasoning about exactly these economic thresholds) and Stage 5
+(coalitions splitting exactly this kind of marginal value) are where the
+interesting work is, not the routing layer. The original prediction ("OR-Tools
+should be stricter") didn't hold; it was aimed at the layer that turns out
+not to matter much here.
 
-### The 20-seed sweep: a surprising stability
+### The 20-seed sweep, and a coincidence worth checking rather than trusting
 
 `scripts/run_stage1_full_diagnostics.py` Part 3, rate check ON (the Stage 1
 default), 20 seeds:
@@ -502,15 +553,35 @@ default), 20 seeds:
 
 This is statistically indistinguishable from Stage 0's own 20-seed mean
 (40.1% ± 6.5pp, range 27.6-52.3%) computed before any of Stage 1 existed.
-**The single-seed ablation comparison above (24.6% vs 30.9%, a 6.3pp gap)
-does not survive at the population level** -- averaged over 20 seeds, adding
-OR-Tools and the rate check together left the mean essentially unchanged,
-even though it visibly shifts individual-seed values and the veto-reason mix
-substantially. This is the same lesson as the very first seed-variance
-check, now applied one level up: a single-seed comparison of two
-*methodologies* can be just as misleading as a single-seed measurement of
-one methodology's headline number. Report sweeps when comparing methods, not
-just when reporting one method's result.
+Two identical means with visibly different per-seed values and veto patterns
+underneath is the kind of agreement that can mean a metric is dominated by
+something structural rather than by the mechanism being tested -- worth
+checking, not just accepting. Since both sweeps use the same 20 seeds, and a
+seed fixes the same underlying trucks/loads regardless of mechanism, the
+per-seed values are a real paired comparison, not two independent samples:
+
+| | value |
+|---|---|
+| Pearson correlation (Stage 0 vs Stage 1, per seed) | **r = 0.77** |
+| mean per-seed difference (Stage 1 - Stage 0) | +0.02pp |
+| stdev of the per-seed difference | 4.2pp |
+| range of the per-seed difference | -8.0pp to +9.2pp |
+
+**This is a real finding, not a coincidence.** r = 0.77 confirms the two
+sweeps are measuring the same underlying phenomenon (an easy seed for Stage 0
+is an easy seed for Stage 1) rather than two unrelated distributions that
+happen to share a mean. At the same time, the per-seed difference has real
+spread (sd 4.2pp, swinging from -8.0 to +9.2pp) -- OR-Tools plus the rate
+check genuinely does shift individual outcomes, sometimes substantially, in
+both directions depending on the seed's specific trucks and loads. Those
+shifts net out to essentially zero on average *for this particular
+combination of changes* (OR-Tools' near-null effect plus the rate check's
+modest effect happen to average out fleet-wide) -- that's a property of what
+changed between Stage 0 and Stage 1, not a guarantee that any two versions of
+this simulator will always land on the same mean. **The single-seed ablation
+comparison above (24.6% vs 30.9%, a 6.3pp gap) does not survive at the
+population level** -- this is the same lesson as the very first seed-variance
+check, now applied to comparing two methodologies rather than measuring one.
 
 ### The reservation-rate calibration sweep: robust headline, sensitive attribution
 
@@ -539,6 +610,20 @@ law of the simulation; a different, equally defensible calibration choice
 would have made `home_deadline` or `detour_limit` look dominant instead.
 Report the headline number with confidence; report which reason "wins" only
 alongside the calibration it was measured under.
+
+**Why the band holds, and why that's not the same as "proven robust in
+general."** `empty_km` reduction counts matches actually made; tightening
+the rate threshold mostly *redistributes* which candidate a truck ends up
+matching (or redistributes rejection from one veto reason to another,
+per the table above), rather than eliminating matching altogether -- most
+rejected candidates aren't a truck's only option, just its first one. That's
+why the band holds across 6-10 through 12-17. It is not evidence that the
+metric is robust to *any* calibration: push reservation rates far enough
+above every plausible posted rate and matching would eventually collapse
+toward the baseline's own performance, at which point the reduction would
+fall, not hold. The band is a property of the range actually tested (a
+roughly 2x span around the demand side's rate), not a proof that the
+headline is calibration-proof in general.
 
 ### On the broker-commission result
 
