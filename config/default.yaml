@@ -120,3 +120,27 @@ optimizer:
   # metaheuristic: identical input must give identical output.
   time_limit_ms: 50
   first_solution_strategy: "PATH_CHEAPEST_ARC"
+
+llm:
+  # Groq, OpenAI-compatible endpoint, behind the swappable LLMBackend
+  # interface (negotiation.py) -- not Anthropic. Real Developer-tier account
+  # limits below (checked against the account, not assumed); requests/day is
+  # what actually binds, not requests/minute. See CLAUDE.md before changing
+  # any of this.
+  provider: "groq"
+  counterparty:
+    model: "openai/gpt-oss-20b"
+    requests_per_minute: 30
+    requests_per_day: 1000
+    tokens_per_minute: 8000
+  visitor:
+    # Same rate-limit bucket size as the counterparty model -- use the larger
+    # model here because this is the one output a visitor actually reads.
+    model: "openai/gpt-oss-120b"
+    requests_per_minute: 30
+    requests_per_day: 1000
+    tokens_per_minute: 8000
+  max_negotiation_rounds: 4 # cut from 6 once real RPD showed up as the binding constraint
+  max_llm_calls_per_session: 40 # hard cap; session ends cleanly, never hangs, never silently overspends
+  timeout_seconds: 15
+  retry_attempts: 2

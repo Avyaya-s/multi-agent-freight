@@ -53,6 +53,12 @@ class EventType(str, Enum):
     TRUCK_IDLE_STARTED = "truck_idle_started"
     TRUCK_IDLE_ENDED = "truck_idle_ended"
 
+    # Stage 2: negotiation. entity_id is negotiation_id throughout, same
+    # pattern as MATCH_PROPOSED/VERIFIED/VETOED.
+    NEGOTIATION_MESSAGE = "negotiation_message"  # the structured protocol turn (what crosses sides)
+    AGENT_REASONING = "agent_reasoning"  # free-text reasoning, omniscient-log only, never shown to the other party
+    NEGOTIATION_ENDED = "negotiation_ended"
+
 
 class DeparturePurpose(str, Enum):
     DELIVERY = "delivery"  # laden, carrying a matched load
@@ -86,6 +92,26 @@ class FeasibilityLayer(str, Enum):
 
     PHYSICAL = "physical"
     PREFERENCE = "preference"
+
+
+class NegotiationMessageType(str, Enum):
+    OFFER = "offer"
+    COUNTER = "counter"
+    ACCEPT = "accept"
+    REJECT = "reject"
+    WITHDRAW = "withdraw"
+
+
+class NegotiationOutcome(str, Enum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    WITHDRAWN = "withdrawn"
+    MAX_ROUNDS_EXCEEDED = "max_rounds_exceeded"
+
+
+class NegotiationParty(str, Enum):
+    TRUCKER = "trucker"
+    SHIPPER = "shipper"
 
 
 class DealFailureReason(str, Enum):

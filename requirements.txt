@@ -6,3 +6,4 @@ PyYAML==6.0.3
 pytest==9.1.1
 matplotlib==3.11.2
 ortools==9.15.6755
+openai==3.24.0  # used only as a client for Groq's OpenAI-compatible endpoint -- see llm_backend.py

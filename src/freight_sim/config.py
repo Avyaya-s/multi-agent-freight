@@ -93,6 +93,26 @@ class SolverConfig(BaseModel):
     first_solution_strategy: str
 
 
+class LLMRoleConfig(BaseModel):
+    model: str
+    # Groq's real per-model Developer-tier limits (checked against the
+    # account, not assumed) -- requests/day is the binding constraint, not
+    # requests/minute. See CLAUDE.md before changing any of these.
+    requests_per_minute: float
+    requests_per_day: float
+    tokens_per_minute: float
+
+
+class LLMConfig(BaseModel):
+    provider: str  # "groq" for now; LLMBackend is the swap point, not this field
+    counterparty: LLMRoleConfig
+    visitor: LLMRoleConfig
+    max_negotiation_rounds: int
+    max_llm_calls_per_session: int
+    timeout_seconds: float
+    retry_attempts: int
+
+
 class Config(BaseModel):
     run: RunConfig
     network: NetworkConfig
@@ -100,6 +120,7 @@ class Config(BaseModel):
     demand: DemandConfig
     matching: MatchingConfig
     optimizer: SolverConfig
+    llm: LLMConfig
 
 
 def config_hash(raw_text: str) -> str:

@@ -17,6 +17,11 @@ leans on. Two kinds of check:
     reservation price: a trucker's preference layer legitimately compares
     against the load's public posted rate, never the shipper's secret
     reservation price underneath it.
+
+Stage 2's equivalent coverage (build_trucker_context never reads
+load.private; build_shipper_context never reads truck.private) lives in
+tests/test_negotiation.py, next to the rest of that module's tests, rather
+than duplicated here.
 """
 
 from __future__ import annotations
