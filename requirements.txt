@@ -7,3 +7,6 @@ pytest==9.1.1
 matplotlib==3.11.2
 ortools==9.15.6755
 openai==3.24.0  # used only as a client for Groq's OpenAI-compatible endpoint -- see llm_backend.py
+fastapi==0.121.2
+uvicorn[standard]==0.38.0
+httpx==0.28.1  # fastapi's TestClient and WebSocket test client in tests/test_api.py

@@ -113,6 +113,17 @@ class LLMConfig(BaseModel):
     retry_attempts: int
 
 
+class InteractiveConfig(BaseModel):
+    # Interactive mode's own fleet size -- deliberately separate from
+    # fleet.num_trucks (batch mode's 40): a market where every counterparty
+    # is itself an LLM call stays small by design. See CLAUDE.md.
+    counterparty_fleet_size: int
+    # Per-session rate limit on "run it live" -- shared across all visitors
+    # (there are no accounts to key it on), not a per-model RPM/RPD/TPM
+    # limit (RateLimiter already covers those).
+    max_sessions_per_hour: int
+
+
 class Config(BaseModel):
     run: RunConfig
     network: NetworkConfig
@@ -121,6 +132,7 @@ class Config(BaseModel):
     matching: MatchingConfig
     optimizer: SolverConfig
     llm: LLMConfig
+    interactive: InteractiveConfig
 
 
 def config_hash(raw_text: str) -> str:

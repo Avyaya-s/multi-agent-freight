@@ -144,3 +144,10 @@ llm:
   max_llm_calls_per_session: 40 # hard cap; session ends cleanly, never hangs, never silently overspends
   timeout_seconds: 15
   retry_attempts: 2
+
+interactive:
+  # Small by design -- every counterparty is itself an LLM call. 8-12 per
+  # CLAUDE.md, not batch mode's 40-truck fleet.
+  counterparty_fleet_size: 10
+  # Shared across all visitors (no accounts to key a per-user limit on).
+  max_sessions_per_hour: 20

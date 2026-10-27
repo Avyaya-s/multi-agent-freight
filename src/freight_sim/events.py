@@ -43,6 +43,13 @@ class EventType(str, Enum):
     DEAL_CREATED = "deal_created"
     DEAL_COMPLETED = "deal_completed"
     DEAL_FAILED = "deal_failed"
+    # Interactive mode only: the visitor's own accept/reject of a PROPOSED
+    # deal their agent brought back -- distinct from DEAL_COMPLETED/FAILED,
+    # which describe batch mode's simulated execution of a deal's legs. A
+    # sandbox deal never executes (no real cargo moves), so accept/reject is
+    # the terminal event for it.
+    DEAL_ACCEPTED = "deal_accepted"
+    DEAL_REJECTED = "deal_rejected"
 
     TRUCK_DEPARTED = "truck_departed"
     TRUCK_ARRIVED = "truck_arrived"
@@ -58,6 +65,10 @@ class EventType(str, Enum):
     NEGOTIATION_MESSAGE = "negotiation_message"  # the structured protocol turn (what crosses sides)
     AGENT_REASONING = "agent_reasoning"  # free-text reasoning, omniscient-log only, never shown to the other party
     NEGOTIATION_ENDED = "negotiation_ended"
+
+    # Interactive mode only: one web session, not the batch simulator.
+    SESSION_STARTED = "session_started"
+    SESSION_ENDED = "session_ended"
 
 
 class DeparturePurpose(str, Enum):

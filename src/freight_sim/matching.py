@@ -26,3 +26,20 @@ def propose_candidates(truck: Truck, open_loads: list[Load], matching_cfg: Match
     ]
     candidates.sort(key=lambda load: haversine_km(truck.platform.current_location, load.public.origin))
     return candidates
+
+
+def propose_truck_candidates(load: Load, available_trucks: list[Truck], matching_cfg: MatchingConfig) -> list[Truck]:
+    """Mirror of propose_candidates for the opposite direction -- interactive
+    mode's shipper-visitor path (one load, screening candidate trucks) needs
+    this where batch mode never did (it only ever decides truck-first, see
+    simulator.py). Same visibility rule: only a truck's platform tier and a
+    load's public tier are read, never either side's private data."""
+    candidates = [
+        truck
+        for truck in available_trucks
+        if load.public.weight_kg <= truck.platform.spare_capacity_weight_kg
+        and load.public.volume_m3 <= truck.platform.spare_capacity_volume_m3
+        and haversine_km(truck.platform.current_location, load.public.origin) <= matching_cfg.max_candidate_detour_km
+    ]
+    candidates.sort(key=lambda truck: haversine_km(truck.platform.current_location, load.public.origin))
+    return candidates
